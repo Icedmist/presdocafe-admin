@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  $(if refresh-timeout)<meta http-equiv="refresh" content="$(refresh-timeout-secs)" />$(endif)
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Session Status — PresdoCafe Wi-Fi</title>
+  <style>
+    body { margin:0; min-height:100vh; font-family:system-ui,sans-serif; background:#020617; color:#f8fafc; display:grid; place-items:center; padding:1.25rem; }
+    .card { max-width:420px; width:100%; background:#0f172a; border:1px solid #1e293b; border-radius:16px; padding:1.75rem; }
+    h2 { margin:0 0 1rem; color:#38bdf8; }
+    table { width:100%; border-collapse:collapse; margin-bottom:1.25rem; font-size:.9rem; }
+    td { padding:.55rem 0; border-bottom:1px solid #1e293b; }
+    td:last-child { text-align:right; font-weight:600; }
+    button { width:100%; padding:.8rem; border:0; border-radius:10px; background:#ef4444; color:#fff; font-weight:700; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>PresdoCafe Session Active</h2>
+    <table>
+      <tr><td>Voucher</td><td>$(username)</td></tr>
+      <tr><td>IP Address</td><td>$(ip)</td></tr>
+      <tr><td>Connected Time</td><td>$(uptime)</td></tr>
+      $(if session-time-left)<tr><td>Time Left</td><td>$(session-time-left)</td></tr>$(endif)
+      <tr><td>Download / Upload</td><td>$(bytes-out-nice) / $(bytes-in-nice)</td></tr>
+      $(if remain-bytes-total)<tr><td>Data Left</td><td>$(remain-bytes-total-nice)</td></tr>$(endif)
+    </table>
+    <form action="$(link-logout)" name="logout" method="post">
+      <input type="hidden" name="erase-cookie" value="on" />
+      <button type="submit">Disconnect Session</button>
+    </form>
+  </div>
+</body>
+</html>

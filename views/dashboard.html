@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PresdoCafe HotSpot Admin</title>
+  <link rel="icon" href="/assets/cell_tower.png">
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <img src="/assets/cell_tower.png" alt="PresdoCafe cell tower" class="brand-img">
+      <div>
+        <h1>PresdoCafe HotSpot Admin</h1>
+        <small>Live RouterOS control • MikroTik CCR2004 • presdocafe.ng</small>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span id="sync_time" class="muted small"></span>
+      <button type="button" id="sync_btn" class="sec">Sync Now</button>
+      <form method="POST" action="/logout">
+        <button type="submit" class="sec">Logout</button>
+      </form>
+    </div>
+  </header>
+
+  <div id="router_banner" class="banner hidden"></div>
+
+  <section class="kpis">
+    <div class="kpi"><small>Active Sessions</small><strong id="k_active">0</strong></div>
+    <div class="kpi"><small>Tracked Vouchers</small><strong id="k_total">0</strong></div>
+    <div class="kpi"><small>Issued Voucher Value</small><strong id="k_ngn">₦0</strong></div>
+    <div class="kpi"><small>Live RouterOS Profiles</small><strong id="k_plans">0</strong></div>
+  </section>
+
+  <section class="grid">
+    <div class="card" id="plan_card">
+      <h3 id="plan_form_title">Create / Edit Plan Profile</h3>
+      <p class="hint">Saving writes the profile to RouterOS and stores NGN price + data-cap metadata in SQLite. Data caps are enforced per voucher with <code>limit-bytes-total</code>.</p>
+      <input type="hidden" id="p_orig">
+      <label for="p_name">RouterOS profile name</label>
+      <input id="p_name" placeholder="e.g. 1h-2gb-5m" autocomplete="off">
+      <label for="p_price">Price (NGN)</label>
+      <input id="p_price" type="number" min="0" step="50" placeholder="e.g. 500">
+      <label for="p_rate">Speed / rate limit (rx/tx)</label>
+      <input id="p_rate" placeholder="e.g. 5M/5M" autocomplete="off">
+      <label for="p_gb">Data cap (GB, 0 = unlimited)</label>
+      <input id="p_gb" type="number" min="0" step="0.5" placeholder="e.g. 2">
+      <label for="p_uptime">Session timeout / uptime (e.g. 1h, 1d, 7d, none)</label>
+      <input id="p_uptime" placeholder="e.g. 1d" autocomplete="off">
+      <div class="btn-row">
+        <button type="button" id="save_plan_btn">Save Plan to MikroTik</button>
+        <button type="button" class="sec" id="clear_plan_btn">Clear</button>
+      </div>
+      <div id="plan_status" class="status-line"></div>
+    </div>
+
+    <div class="card">
+      <h3>Generate &amp; Print Vouchers</h3>
+      <p class="hint">Every voucher carries its plan name, price, speed, data cap, uptime and creation time in SQLite and on the printed slip.</p>
+      <label for="v_plan">Plan</label>
+      <select id="v_plan"></select>
+      <label for="v_prefix">Code prefix</label>
+      <input id="v_prefix" value="PC" maxlength="8" placeholder="e.g. PC">
+      <label for="v_count">How many vouchers?</label>
+      <input id="v_count" type="number" value="5" min="1" max="200">
+      <div class="btn-row">
+        <button type="button" id="gen_btn">Generate Vouchers</button>
+        <button type="button" class="sec" id="print_all_btn">Print All Slips</button>
+      </div>
+      <div id="voucher_status" class="status-line"></div>
+      <div id="print_area" class="vgrid" aria-live="polite"></div>
+    </div>
+
+    <div class="card">
+      <h3>RouterOS Connection Settings</h3>
+      <p class="hint">Saved once to <code>.env</code> and the SQLite <code>settings</code> table. Voucher actions never ask for a router password.</p>
+      <label for="s_host">Host / IP</label>
+      <input id="s_host" placeholder="192.168.88.1" autocomplete="off">
+      <label for="s_port">API port</label>
+      <input id="s_port" type="number" min="1" max="65535" placeholder="8728">
+      <label for="s_user">API username</label>
+      <input id="s_user" placeholder="admin" autocomplete="username">
+      <label for="s_pass">API password</label>
+      <div class="pass-row">
+        <input id="s_pass" type="password" placeholder="RouterOS API password" autocomplete="current-password">
+        <button type="button" class="sec" id="toggle_pass_btn" aria-label="Show or hide API password">Show</button>
+      </div>
+      <div class="btn-row">
+        <button type="button" id="save_settings_btn">Save Credentials</button>
+        <button type="button" class="sec" id="test_settings_btn">Test Connection</button>
+      </div>
+      <div id="settings_status" class="status-line"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h3>RouterOS Profiles &amp; Plans</h3>
+      <span class="muted small">Live profiles are pulled from <code>/ip/hotspot/user/profile/print</code></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Profile Name</th><th>Price</th><th>Speed</th><th>Data Cap</th><th>Timeout</th><th>Shared</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody id="plans_tb"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h3>Vouchers, Usage &amp; MAC Locks</h3>
+      <input id="u_filter" placeholder="Filter by code, plan, MAC or comment…" class="filter">
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Code</th><th>Plan / Price</th><th>Speed</th><th>Data Used / Cap</th><th>Uptime Used / Limit</th><th>Status / MAC</th><th>Created</th><th>Actions</th></tr></thead>
+        <tbody id="users_tb"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h3>Active HotSpot Sessions</h3>
+      <span class="muted small">Live from <code>/ip/hotspot/active/print</code></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Voucher</th><th>Plan</th><th>Price</th><th>Speed</th><th>IP</th><th>MAC</th><th>Session Uptime</th><th>Time Left</th><th>Session Data</th><th>Action</th></tr></thead>
+        <tbody id="active_tb"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

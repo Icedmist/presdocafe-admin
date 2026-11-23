@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="2; url=$(link-status)" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Connected — PresdoCafe Wi-Fi</title>
+  <style>
+    body { margin:0; min-height:100vh; font-family:system-ui,sans-serif; background:#020617; color:#f8fafc; display:grid; place-items:center; padding:1.25rem; }
+    .card { max-width:400px; width:100%; background:#0f172a; border:1px solid #1e293b; border-radius:16px; padding:1.75rem; text-align:center; }
+    h2 { margin:0 0 .5rem; color:#38bdf8; }
+    p { color:#94a3b8; font-size:.9rem; }
+    a { color:#38bdf8; text-decoration:none; font-weight:600; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>You're Online!</h2>
+    <p>Voucher <strong>$(username)</strong> is active. Redirecting to your session status...</p>
+    <p><a href="$(link-status)">View Live Data & Time Remaining</a></p>
+  </div>
+</body>
+</html>
