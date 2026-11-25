@@ -1,8 +1,10 @@
-require('dotenv').config();
-
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+
+// Where the app keeps .env and presdocafe.db. Set by bin/presdocafe.js.
+const DATA_DIR = process.env.PRESDOCAFE_DATA_DIR || __dirname;
+require('dotenv').config({ path: path.join(DATA_DIR, '.env') });
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
@@ -10,7 +12,7 @@ const Database = require('better-sqlite3');
 const { RouterOSAPI, Channel, Receiver } = require('node-routeros');
 
 const app = express();
-const db = new Database(path.join(__dirname, 'presdocafe.db'));
+const db = new Database(path.join(DATA_DIR, 'presdocafe.db'));
 
 /*
  * RouterOS 7.16+ can answer an empty /print with "!empty" followed by "!done".
@@ -141,7 +143,7 @@ function quoteEnvValue(value) {
 }
 
 function updateEnvFile(updates) {
-  const envPath = path.join(__dirname, '.env');
+  const envPath = path.join(DATA_DIR, '.env');
   const content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
   const keys = Object.keys(updates);
   const seen = new Set();
@@ -268,6 +270,94 @@ async function rosWrite(api, command, params = [], timeoutMs = 20000) {
     throw new RouterOSError(message, err);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* MikroTik REST API client (RouterOS v7+)                            */
+/* ------------------------------------------------------------------ */
+
+function restBaseUrl(cfg) {
+  return 'http://' + cfg.host + ':80';
+}
+
+function restAuthHeader(cfg) {
+  const token = Buffer.from(cfg.user + ':' + cfg.password).toString('base64');
+  return 'Basic ' + token;
+}
+
+async function restRequest(cfg, method, path, body = null, timeoutMs = 20000) {
+  const url = restBaseUrl(cfg) + path;
+  const opts = {
+    method: method,
+    headers: {
+      'Authorization': restAuthHeader(cfg),
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    timeout: timeoutMs
+  };
+  if (body !== null) {
+    opts.body = JSON.stringify(body);
+  }
+
+  let timer;
+  try {
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), timeoutMs);
+    opts.signal = controller.signal;
+
+    const response = await fetch(url, opts);
+    clearTimeout(timer);
+
+    let data = null;
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      data = await response.json();
+    } else {
+      data = await response.text();
+    }
+
+    if (!response.ok) {
+      const msg = (data && data.message) || data || ('HTTP ' + response.status);
+      throw new Error(path + ' failed: ' + msg);
+    }
+    return data;
+  } catch (err) {
+    if (timer) clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      throw new Error(path + ' timed out after ' + Math.round(timeoutMs / 1000) + 's');
+    }
+    const message = path + ' failed: ' + (err.message || String(err));
+    console.error('[RouterOS REST] ' + message);
+    throw new RouterOSError(message, err);
+  }
+}
+
+async function restPrint(cfg, path, timeoutMs = 20000) {
+  const data = await restRequest(cfg, 'GET', path + '?print', null, timeoutMs);
+  return Array.isArray(data) ? data : (data && data.data) ? data.data : [];
+}
+
+async function restAdd(cfg, path, attributes, timeoutMs = 20000) {
+  return await restRequest(cfg, 'POST', path + '/add', attributes, timeoutMs);
+}
+
+async function restSet(cfg, path, id, attributes, timeoutMs = 20000) {
+  const body = Object.assign({ '.id': id }, attributes);
+  return await restRequest(cfg, 'POST', path + '/set', body, timeoutMs);
+}
+
+async function restRemove(cfg, path, id, timeoutMs = 20000) {
+  return await restRequest(cfg, 'POST', path + '/remove', { '.id': id }, timeoutMs);
+}
+
+async function withRestRouter(fn, cfg) {
+  const config = cfg || getRouterConfig();
+  try {
+    return await fn(config);
+  } catch (err) {
+    throw err;
   }
 }
 
@@ -418,11 +508,24 @@ function buildVoucherRows(dbVouchers, users, activeSessions, planRows, profiles)
     const overseasCap = Number((user && user['limit-bytes-total']) || 0);
     const savedCap = Number((voucher && voucher.data_bytes) || 0);
     const capBytes = overseasCap > 0 ? overseasCap : savedCap;
-    const usedBytes = user ? Number(user['bytes-in'] || 0) + Number(user['bytes-out'] || 0) : null;
+    // RouterOS 7 often keeps /ip/hotspot/user byte+uptime counters at 0 until logout.
+    // Prefer live /ip/hotspot/active counters while the voucher is online.
+    const userBytes = user ? Number(user['bytes-in'] || 0) + Number(user['bytes-out'] || 0) : null;
+    const activeBytes = active
+      ? Number(active['bytes-in'] || 0) + Number(active['bytes-out'] || 0)
+      : null;
+    const usedBytes = activeBytes !== null
+      ? Math.max(userBytes || 0, activeBytes)
+      : userBytes;
     const uptimeLimit = (user && user['limit-uptime']) || (voucher && voucher.uptime_limit) || 'none';
-    const uptimeUsed = user ? (user.uptime || '0s') : null;
+    const uptimeUsed = (active && active.uptime) || (user ? (user.uptime || '0s') : null);
     const limitSeconds = parseRosDuration(uptimeLimit);
     const usedSeconds = parseRosDuration(uptimeUsed);
+    const activeTimeLeftSeconds = active ? parseRosDuration(active['session-time-left']) : null;
+    const remainingUptimeSeconds = activeTimeLeftSeconds !== null
+      ? activeTimeLeftSeconds
+      : (limitSeconds !== null && usedSeconds !== null
+        ? Math.max(0, limitSeconds - usedSeconds) : null);
 
     return {
       code,
@@ -437,8 +540,7 @@ function buildVoucherRows(dbVouchers, users, activeSessions, planRows, profiles)
       remaining_data_bytes: capBytes > 0 && usedBytes !== null ? Math.max(0, capBytes - usedBytes) : null,
       uptime_limit: uptimeLimit,
       uptime_used: uptimeUsed,
-      remaining_uptime_seconds: limitSeconds !== null && usedSeconds !== null
-        ? Math.max(0, limitSeconds - usedSeconds) : null,
+      remaining_uptime_seconds: remainingUptimeSeconds,
       session_timeout: (voucher && voucher.session_timeout) ||
         (liveProfile && liveProfile['session-timeout']) || (plan && plan.session_timeout) || 'none',
       created_at: voucher ? voucher.created_at : null,
@@ -601,22 +703,47 @@ app.post('/api/settings/test', requireAuth, async (req, res) => {
     password: typeof body.password === 'string' ? body.password : current.password
   };
 
+  let lastError = null;
+  let info = null;
+
+  // Try MikroTik REST API first (RouterOS v7+)
   try {
-    const info = await withRouter(async api => {
-      const resource = await rosWrite(api, '/system/resource/print');
-      const profiles = await rosWrite(api, '/ip/hotspot/user/profile/print');
-      const first = resource[0] || {};
-      return {
-        version: first.version || 'unknown',
-        board: first['board-name'] || 'RouterOS',
-        profiles: profiles.filter(p => p && p.name && !isSystemProfile(p)).length
-      };
-    }, cfg);
-    res.json({ ok: true, ...info, host: cfg.host, port: cfg.port, user: cfg.user });
+    const resource = await restRequest(cfg, 'GET', '/rest/system/resource/print');
+    const profiles = await restPrint(cfg, '/rest/ip/hotspot/user/profile');
+    const first = Array.isArray(resource) ? (resource[0] || {}) : (resource || {});
+    info = {
+      version: first.version || 'unknown',
+      board: first['board-name'] || 'RouterOS',
+      profiles: profiles.filter(p => p && p.name && !isSystemProfile(p)).length,
+      transport: 'rest'
+    };
   } catch (err) {
-    console.error('[settings] Connection test failed: ' + err.message);
-    res.status(502).json({ error: err.message, hint: routerHint(err) });
+    lastError = err;
+    console.error('[settings] REST test failed: ' + err.message);
   }
+
+  // Fall back to legacy RouterOS API
+  if (!info) {
+    try {
+      const result = await withRouter(async api => {
+        const resource = await rosWrite(api, '/system/resource/print');
+        const profiles = await rosWrite(api, '/ip/hotspot/user/profile/print');
+        const first = resource[0] || {};
+        return {
+          version: first.version || 'unknown',
+          board: first['board-name'] || 'RouterOS',
+          profiles: profiles.filter(p => p && p.name && !isSystemProfile(p)).length,
+          transport: 'legacy'
+        };
+      }, cfg);
+      info = result;
+    } catch (err2) {
+      console.error('[settings] Connection test failed: ' + err2.message);
+      return res.status(502).json({ error: err2.message, hint: routerHint(err2) });
+    }
+  }
+
+  res.json({ ok: true, ...info, host: cfg.host, port: cfg.port, user: cfg.user });
 });
 
 /* ------------------------------------------------------------------ */
@@ -634,24 +761,45 @@ app.get('/api/state', requireAuth, async (req, res) => {
   let users = [];
   const routerErrors = [];
   const cfg = getRouterConfig();
+  let transport = 'legacy';
+  let restError = null;
 
+  // Try MikroTik REST API first (RouterOS v7+)
   try {
-    await withRouter(async api => {
-      const read = async command => {
-        try {
-          return await rosWrite(api, command);
-        } catch (err) {
-          routerErrors.push(err.message);
-          return [];
-        }
-      };
-      profiles = await read('/ip/hotspot/user/profile/print');
-      activeSessions = await read('/ip/hotspot/active/print');
-      users = await read('/ip/hotspot/user/print');
-    });
+    profiles = await restPrint(cfg, '/rest/ip/hotspot/user/profile');
+    activeSessions = await restPrint(cfg, '/rest/ip/hotspot/active');
+    users = await restPrint(cfg, '/rest/ip/hotspot/user');
+    transport = 'rest';
   } catch (err) {
-    routerErrors.push(err.message);
-    console.error('[state] RouterOS unavailable: ' + err.message);
+    restError = err;
+    console.error('[state] REST read failed: ' + err.message);
+  }
+
+  // Fall back to legacy RouterOS API if REST failed
+  if (restError || (profiles.length === 0 && users.length === 0 && activeSessions.length === 0)) {
+    profiles = [];
+    activeSessions = [];
+    users = [];
+    try {
+      await withRouter(async api => {
+        const read = async command => {
+          try {
+            return await rosWrite(api, command);
+          } catch (err) {
+            routerErrors.push(err.message);
+            return [];
+          }
+        };
+        profiles = await read('/ip/hotspot/user/profile/print');
+        activeSessions = await read('/ip/hotspot/active/print');
+        users = await read('/ip/hotspot/user/print');
+      });
+      transport = 'legacy';
+    } catch (err) {
+      if (restError) routerErrors.push('REST: ' + restError.message);
+      routerErrors.push(err.message);
+      console.error('[state] RouterOS unavailable: ' + err.message);
+    }
   }
 
   const plans = buildPlanRows(profiles, dbPlans);
@@ -671,7 +819,8 @@ app.get('/api/state', requireAuth, async (req, res) => {
       connected: routerErrors.length === 0,
       error: routerErrors[0] || null,
       errors: routerErrors,
-      hint: routerErrors.length ? routerHint(new RouterOSError(routerErrors[0])) : null
+      hint: routerErrors.length ? routerHint(new RouterOSError(routerErrors[0])) : null,
+      transport: transport
     }
   });
 });
@@ -804,18 +953,33 @@ app.post('/api/plans/delete', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'The RouterOS default profile cannot be deleted.' });
   }
 
+  const cfg = getRouterConfig();
   let warning = null;
+
+  // Try MikroTik REST API first (RouterOS v7+)
   try {
-    await withRouter(async api => {
-      const rows = await rosWrite(api, '/ip/hotspot/user/profile/print', ['?name=' + profileName]);
-      if (rows.length) {
-        await rosWrite(api, '/ip/hotspot/user/profile/remove', ['=.id=' + rows[0]['.id']]);
-      } else {
-        warning = 'The profile was not present on RouterOS; local metadata was removed.';
-      }
-    });
-  } catch (err) {
-    return sendApiError(res, err);
+    const rows = await restPrint(cfg, '/rest/ip/hotspot/user/profile');
+    const match = rows.find(r => r && r.name === profileName);
+    if (match) {
+      await restRemove(cfg, '/rest/ip/hotspot/user/profile', match.id);
+    } else {
+      warning = 'The profile was not present on RouterOS; local metadata was removed.';
+    }
+  } catch (restErr) {
+    console.error('[plans/delete] REST failed, falling back to legacy API: ' + restErr.message);
+    // Fall back to legacy RouterOS API
+    try {
+      await withRouter(async api => {
+        const rows = await rosWrite(api, '/ip/hotspot/user/profile/print', ['?name=' + profileName]);
+        if (rows.length) {
+          await rosWrite(api, '/ip/hotspot/user/profile/remove', ['=.id=' + rows[0]['.id']]);
+        } else {
+          warning = 'The profile was not present on RouterOS; local metadata was removed.';
+        }
+      });
+    } catch (err) {
+      return sendApiError(res, err);
+    }
   }
 
   const usedBy = db.prepare('SELECT COUNT(*) AS count FROM vouchers WHERE plan_profile = ?').get(profileName).count;
@@ -968,25 +1132,47 @@ app.post('/api/vouchers/generate', requireAuth, async (req, res) => {
 app.post('/api/vouchers/delete', requireAuth, async (req, res) => {
   const name = String((req.body && req.body.name) || '').trim();
   if (!name) return res.status(400).json({ error: 'Voucher code is required.' });
+  const cfg = getRouterConfig();
 
+  // Try MikroTik REST API first (RouterOS v7+)
   try {
-    await withRouter(async api => {
-      const activeRows = await rosWrite(api, '/ip/hotspot/active/print', ['?user=' + name]);
-      const rows = await rosWrite(api, '/ip/hotspot/user/print', ['?name=' + name]);
-
-      if (rows.length) {
-        await rosWrite(api, '/ip/hotspot/user/remove', ['=.id=' + rows[0]['.id']]);
-      }
-      for (const session of activeRows) {
+    const users = await restPrint(cfg, '/rest/ip/hotspot/user');
+    const match = users.find(u => u && u.name === name);
+    if (match) {
+      await restRemove(cfg, '/rest/ip/hotspot/user', match.id);
+    }
+    const actives = await restPrint(cfg, '/rest/ip/hotspot/active');
+    for (const session of actives) {
+      if (session && session.user === name && session.id) {
         try {
-          await rosWrite(api, '/ip/hotspot/active/remove', ['=.id=' + session['.id']]);
+          await restRemove(cfg, '/rest/ip/hotspot/active', session.id);
         } catch (err) {
           console.error('[vouchers] Could not remove active session for ' + name + ': ' + err.message);
         }
       }
-    });
-  } catch (err) {
-    return sendApiError(res, err);
+    }
+  } catch (restErr) {
+    console.error('[vouchers/delete] REST failed, falling back to legacy API: ' + restErr.message);
+    // Fall back to legacy RouterOS API
+    try {
+      await withRouter(async api => {
+        const activeRows = await rosWrite(api, '/ip/hotspot/active/print', ['?user=' + name]);
+        const rows = await rosWrite(api, '/ip/hotspot/user/print', ['?name=' + name]);
+
+        if (rows.length) {
+          await rosWrite(api, '/ip/hotspot/user/remove', ['=.id=' + rows[0]['.id']]);
+        }
+        for (const session of activeRows) {
+          try {
+            await rosWrite(api, '/ip/hotspot/active/remove', ['=.id=' + session['.id']]);
+          } catch (err) {
+            console.error('[vouchers] Could not remove active session for ' + name + ': ' + err.message);
+          }
+        }
+      });
+    } catch (err) {
+      return sendApiError(res, err);
+    }
   }
 
   db.prepare('DELETE FROM vouchers WHERE code = ?').run(name);
@@ -1031,7 +1217,27 @@ app.post('/api/vouchers/unlock-mac', requireAuth, async (req, res) => {
 app.post('/api/sessions/kick', requireAuth, async (req, res) => {
   const id = String((req.body && req.body.id) || '').trim();
   const user = String((req.body && req.body.user) || '').trim();
+  const cfg = getRouterConfig();
 
+  // Try MikroTik REST API first (RouterOS v7+)
+  try {
+    let activeId = id;
+    if (!activeId && user) {
+      const rows = await restPrint(cfg, '/rest/ip/hotspot/active');
+      const match = rows.find(r => r && r.user === user);
+      if (match) activeId = match.id;
+    }
+    if (!activeId) {
+      throw httpError(404, 'Active session not found. It may have already disconnected.');
+    }
+    await restRemove(cfg, '/rest/ip/hotspot/active', activeId);
+    return res.json({ ok: true });
+  } catch (restErr) {
+    if (restErr.status === 404) return sendApiError(res, restErr);
+    console.error('[sessions/kick] REST failed, falling back to legacy API: ' + restErr.message);
+  }
+
+  // Fall back to legacy RouterOS API
   try {
     await withRouter(async api => {
       let activeId = id;
@@ -1067,8 +1273,8 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-app.listen(process.env.PORT || 3000, () => {
+app.listen(process.env.PORT || 3000, process.env.BIND_HOST || '0.0.0.0', () => {
   const cfg = getRouterConfig();
-  console.log('PresdoCafe Admin UI listening on http://0.0.0.0:' + (process.env.PORT || 3000));
+  console.log('PresdoCafe Admin UI listening on http://' + (process.env.BIND_HOST || '0.0.0.0') + ':' + (process.env.PORT || 3000));
   console.log('RouterOS target: ' + cfg.user + '@' + cfg.host + ':' + cfg.port);
 });

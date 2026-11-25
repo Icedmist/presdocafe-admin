@@ -155,7 +155,8 @@ function renderBanner(router) {
     el.className = 'banner ok';
     el.innerHTML = '<strong>RouterOS connected</strong> &middot; ' +
       esc(router.user) + '@' + esc(router.host) + ':' + esc(router.port) +
-      ' &middot; ' + cachedPlans.filter(p => p.live).length + ' live hotspot profile(s) loaded.';
+      ' &middot; ' + cachedPlans.filter(p => p.live).length + ' live hotspot profile(s) loaded.' +
+      ' <span class="muted small">[' + esc(router.transport || 'legacy') + ' API]</span>';
     return;
   }
 
